@@ -1,0 +1,39 @@
+{
+  "name": "vaultiq-backend",
+  "version": "1.0.0",
+  "description": "Vaultiq Inventory Management API",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js",
+    "lint": "eslint src/"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "compression": "^1.7.4",
+    "cors": "^2.8.5",
+    "csv-stringify": "^6.5.1",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.3.1",
+    "express-validator": "^7.2.0",
+    "geoip-lite": "^1.4.10",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.3",
+    "morgan": "^1.10.0",
+    "multer": "^1.4.5-lts.1",
+    "node-cron": "^4.6.0",
+    "nodemailer": "^9.0.5",
+    "pg": "^8.22.0",
+    "pino": "^9.3.2",
+    "pino-pretty": "^11.2.1",
+    "uuid": "^10.0.0"
+  },
+  "devDependencies": {
+    "eslint": "^9.9.0",
+    "nodemon": "^3.1.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
