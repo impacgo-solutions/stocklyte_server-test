@@ -12,13 +12,8 @@ for (const key of REQUIRED_ENV) {
     process.exit(1);
   }
 }
-if (!process.env.CORS_ORIGIN) {
-  console.warn('[startup] CORS_ORIGIN not set — allowing all origins. Set this in production.');
-}
-
 const express = require('express');
 const helmet = require('helmet');
-const cors = require('cors');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const pino = require('pino');
@@ -36,11 +31,6 @@ app.set('trust proxy', Number(process.env.TRUST_PROXY) || 1);
 
 // ── Security & Middleware ──────────────────────────────────
 app.use(helmet());
-app.use(cors({
-  origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : true,
-  credentials: true,
-}));
-
 app.use(compression());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
