@@ -19,7 +19,6 @@ const TABLES = [
 function foreignKeyStatements(schemaName) {
   const q = (name) => `"${schemaName}".${name}`;
   return [
-    `alter table ${q('admin_users')} add constraint admin_users_id_fkey foreign key (id) references auth.users(id) on delete cascade`,
     `alter table ${q('admin_users')} add constraint admin_users_location_id_fkey foreign key (location_id) references ${q('locations')}(id) on delete set null`,
     `alter table ${q('products')} add constraint products_category_id_fkey foreign key (category_id) references ${q('categories')}(id) on delete set null`,
     `alter table ${q('stock')} add constraint stock_product_id_fkey foreign key (product_id) references ${q('products')}(id) on delete cascade`,

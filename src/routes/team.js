@@ -1,6 +1,7 @@
 'use strict';
 const router = require('express').Router();
-const { supabase } = require('../utils/supabase');
+const bcrypt = require('bcryptjs');
+const { v4: uuidv4 } = require('uuid');
 const { pool, withTenant } = require('../utils/db');
 const authenticate = require('../middleware/auth');
 const checkSubscription = require('../middleware/checkSubscription');
@@ -38,35 +39,32 @@ router.post('/', async (req, res) => {
   if (!EMAIL_RE.test(email)) return fail(res, 'A valid email address is required');
   if (!PHONE_RE.test(phone)) return fail(res, 'A valid phone number is required');
 
-  let authUserId;
   try {
-    const { data: created, error: authError } = await supabase.auth.admin.createUser({
-      email,
-      password,
-      email_confirm: true,
-    });
-    if (authError) throw new Error(authError.message);
-    authUserId = created.user.id;
+    const { rows: dup } = await pool.query(
+      'select 1 from public.tenant_user_index where email = $1',
+      [email.trim().toLowerCase()]
+    );
+    if (dup.length > 0) return fail(res, 'An account with this email already exists.', 409);
 
-    const employee = await withTenant(req.user.tenant_schema, req.user.id, async (client) => {
+    const userId = uuidv4();
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    const employee = await withTenant(req.user.tenant_schema, async (client) => {
       const { rows } = await client.query(
-        `insert into admin_users (id, email, full_name, phone, role, location_id)
-         values ($1, $2, $3, $4, $5, $6) returning *`,
-        [authUserId, email, fullName, phone, role, locationId || null]
+        `insert into admin_users (id, email, full_name, phone, role, location_id, password_hash)
+         values ($1, $2, $3, $4, $5, $6, $7) returning *`,
+        [userId, email.trim().toLowerCase(), fullName, phone, role, locationId || null, passwordHash]
       );
       return rows[0];
     });
 
     await pool.query(
-      'insert into public.tenant_user_index (user_id, schema_name) values ($1, $2)',
-      [authUserId, req.user.tenant_schema]
+      'insert into public.tenant_user_index (user_id, schema_name, email) values ($1, $2, $3)',
+      [userId, req.user.tenant_schema, email.trim().toLowerCase()]
     );
 
     return ok(res, employee, 201);
   } catch (err) {
-    if (authUserId) {
-      await supabase.auth.admin.deleteUser(authUserId).catch(() => {});
-    }
     return fail(res, err.message);
   }
 });

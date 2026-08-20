@@ -1,7 +1,8 @@
 'use strict';
 const router = require('express').Router();
 const rateLimit = require('express-rate-limit');
-const { supabase } = require('../utils/supabase');
+const bcrypt = require('bcryptjs');
+const { v4: uuidv4 } = require('uuid');
 const { pool, withTenant } = require('../utils/db');
 const { resolveSession } = require('../utils/resolveSession');
 const { getCompanySubscription } = require('../utils/subscription');
@@ -11,8 +12,6 @@ const authenticate = require('../middleware/auth');
 const { ok, fail } = require('../utils/response');
 const { sendSignupNotification } = require('../utils/notifyEmail');
 
-// Stricter rate limit for sensitive auth endpoints — much more generous outside
-// production so local dev/testing doesn't get locked out after a handful of tries.
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: process.env.NODE_ENV === 'production' ? 10 : 1000,
@@ -21,8 +20,6 @@ const authLimiter = rateLimit({
   message: { success: false, error: 'Too many attempts, please try again later' }
 });
 
-// Schema provisioning is expensive (creates a whole Postgres schema), so self-signup
-// gets its own tighter limiter rather than sharing authLimiter with /login.
 const signupLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: process.env.NODE_ENV === 'production' ? 10 : 1000,
@@ -33,35 +30,75 @@ const signupLimiter = rateLimit({
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-// POST /auth/login — same endpoint for super admins, Company Admins and Employees.
-// Supabase Auth verifies the password; we then resolve which tenant schema (if any)
-// this user belongs to and mint our own JWT carrying that schema.
+// POST /auth/login
 router.post('/login', authLimiter, async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return fail(res, 'Email and password are required');
 
-  const { data, error } = await supabase.auth.signInWithPassword({ email, password });
-  if (error) return fail(res, error.message, 401);
+  const normalizedEmail = email.trim().toLowerCase();
 
-  let session;
-  try {
-    session = await resolveSession(data.user.id);
-  } catch (err) {
-    return fail(res, err.message, 401);
+  // Check super admin
+  const { rows: saRows } = await pool.query(
+    'select * from public.super_admins where email = $1 and is_active = true',
+    [normalizedEmail]
+  );
+  if (saRows.length > 0) {
+    const sa = saRows[0];
+    const match = await bcrypt.compare(password, sa.password_hash);
+    if (!match) return fail(res, 'Invalid email or password', 401);
+    const tokenPayload = { sub: sa.id, role: 'super_admin' };
+    return ok(res, {
+      access_token: signAccessToken({ ...tokenPayload, email: sa.email }),
+      refresh_token: signRefreshToken(tokenPayload),
+      user: { id: sa.id, email: sa.email, profile: { ...sa, role: 'super_admin' } },
+    });
   }
 
-  const access_token = signAccessToken({ ...session.tokenPayload, email: data.user.email });
-  const refresh_token = signRefreshToken(session.tokenPayload);
+  // Check tenant user via index
+  const { rows: indexRows } = await pool.query(
+    'select user_id, schema_name from public.tenant_user_index where email = $1',
+    [normalizedEmail]
+  );
+  if (indexRows.length === 0) return fail(res, 'Invalid email or password', 401);
+
+  const { user_id, schema_name } = indexRows[0];
+
+  const profile = await withTenant(schema_name, async (client) => {
+    const { rows } = await client.query(
+      'select * from admin_users where id = $1 and is_active = true',
+      [user_id]
+    );
+    return rows[0] || null;
+  });
+  if (!profile) return fail(res, 'Your account is inactive. Contact your administrator.', 401);
+
+  const match = await bcrypt.compare(password, profile.password_hash);
+  if (!match) return fail(res, 'Invalid email or password', 401);
+
+  const subscription = await getCompanySubscription(schema_name);
+  const tokenPayload = {
+    sub: user_id,
+    role: profile.role,
+    tenant_schema: schema_name,
+    location_id: profile.location_id || undefined,
+  };
 
   return ok(res, {
-    access_token,
-    refresh_token,
-    user: { id: data.user.id, email: data.user.email, profile: { ...session.profile, email: data.user.email } }
+    access_token: signAccessToken({ ...tokenPayload, email: profile.email }),
+    refresh_token: signRefreshToken(tokenPayload),
+    user: {
+      id: user_id,
+      email: profile.email,
+      profile: {
+        ...profile,
+        subscription_status: subscription?.subscription_status || null,
+        trial_ends_at: subscription?.trial_ends_at || null,
+      },
+    },
   });
 });
 
-// POST /auth/logout — our JWTs are stateless (no server-side session to revoke); the
-// client just discards its stored token.
+// POST /auth/logout — stateless JWTs, client discards the token
 router.post('/logout', authenticate, async (_req, res) => {
   return ok(res, { message: 'Logged out successfully' });
 });
@@ -108,32 +145,33 @@ router.post('/refresh', async (req, res) => {
     return fail(res, err.message, 401);
   }
 
-  const access_token = signAccessToken(session.tokenPayload);
-  const new_refresh_token = signRefreshToken(session.tokenPayload);
-  return ok(res, { access_token, refresh_token: new_refresh_token });
+  return ok(res, {
+    access_token: signAccessToken(session.tokenPayload),
+    refresh_token: signRefreshToken(session.tokenPayload),
+  });
 });
 
-// POST /auth/signup — public self-service signup for the marketing-site trial flow.
-// Mirrors POST /admin/companies + POST /admin/companies/:schemaName/admins (same
-// clone-from-`template` schema provisioning, same admin_users/tenant_user_index rows)
-// but as a single unauthenticated call that provisions the org and its first Company
-// Admin (role 'admin') together — no table/schema changes, just a new entry point into
-// the existing flow.
+// POST /auth/signup — self-service trial signup
 router.post('/signup', signupLimiter, async (req, res) => {
   const { first_name, last_name, email, phone, organization_name, password } = req.body;
 
   if (!first_name || !String(first_name).trim()) return fail(res, 'first_name is required');
   if (!organization_name || !String(organization_name).trim()) return fail(res, 'organization_name is required');
   if (!email || !EMAIL_RE.test(email)) return fail(res, 'A valid email address is required');
-  if (!password || password.length < 8) return fail(res, 'Password must be at least 8 characters');
+  if (!password || password.length < 6) return fail(res, 'Password must be at least 6 characters');
 
   const normalizedEmail = email.trim().toLowerCase();
-  const fullName = [first_name, last_name]
-    .filter(Boolean)
-    .map((part) => String(part).trim())
-    .join(' ');
+  const fullName = [first_name, last_name].filter(Boolean).map((p) => String(p).trim()).join(' ');
+
+  const { rows: existing } = await pool.query(
+    'select 1 from public.tenant_user_index where email = $1',
+    [normalizedEmail]
+  );
+  if (existing.length > 0) return fail(res, 'An account with this email already exists.', 409);
 
   const schemaName = await generateUniqueSchemaName(pool, organization_name.trim());
+  const userId = uuidv4();
+  const passwordHash = await bcrypt.hash(password, 10);
 
   try {
     await createTenantSchema(schemaName);
@@ -142,68 +180,42 @@ router.post('/signup', signupLimiter, async (req, res) => {
   }
 
   let companyCreated = false;
-  let authUserId;
   try {
     await pool.query(
-      `insert into public.companies (name, schema_name) values ($1, $2)`,
+      'insert into public.companies (name, schema_name) values ($1, $2)',
       [organization_name.trim(), schemaName]
     );
     companyCreated = true;
 
-    const { data: created, error: authError } = await supabase.auth.admin.createUser({
-      email: normalizedEmail,
-      password,
-      email_confirm: true,
-    });
-    if (authError) {
-      const isDuplicate = authError.code === 'email_exists' || /already been registered|already exists/i.test(authError.message);
-      throw Object.assign(new Error(isDuplicate ? 'An account with this email already exists.' : authError.message), {
-        status: isDuplicate ? 409 : 400,
-      });
-    }
-    authUserId = created.user.id;
-
     const adminProfile = await withTenant(schemaName, async (client) => {
       const { rows } = await client.query(
-        `insert into admin_users (id, email, full_name, phone, role) values ($1, $2, $3, $4, 'admin') returning *`,
-        [authUserId, normalizedEmail, fullName, phone ? String(phone).trim() : null]
+        `insert into admin_users (id, email, full_name, phone, role, password_hash)
+         values ($1, $2, $3, $4, 'admin', $5) returning *`,
+        [userId, normalizedEmail, fullName, phone ? String(phone).trim() : null, passwordHash]
       );
       return rows[0];
     });
 
     await pool.query(
-      'insert into public.tenant_user_index (user_id, schema_name) values ($1, $2)',
-      [authUserId, schemaName]
+      'insert into public.tenant_user_index (user_id, schema_name, email) values ($1, $2, $3)',
+      [userId, schemaName, normalizedEmail]
     );
+
     sendSignupNotification({ first_name, last_name, email: normalizedEmail, phone, organization_name, req });
 
     return ok(res, { ...adminProfile, company: { name: organization_name.trim(), schema_name: schemaName } }, 201);
   } catch (err) {
-    if (authUserId) {
-      await supabase.auth.admin.deleteUser(authUserId).catch(() => {});
-    }
     if (companyCreated) {
       await pool.query('delete from public.companies where schema_name = $1', [schemaName]).catch(() => {});
     }
-    // Cascades away any admin_users row already inserted before the failure.
     await pool.query(`drop schema if exists "${schemaName}" cascade`).catch(() => {});
     return fail(res, err.message, err.status || 400);
   }
 });
 
-// POST /auth/forgot-password — unaffected by tenant-schema routing, still a plain
-// Supabase Auth feature.
-router.post('/forgot-password', authLimiter, async (req, res) => {
-  const { email } = req.body;
-  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    return fail(res, 'A valid email address is required');
-  }
-  const redirectTo = process.env.PASSWORD_RESET_REDIRECT_URL;
-  const { error } = await supabase.auth.resetPasswordForEmail(email, {
-    ...(redirectTo ? { redirectTo } : {}),
-  });
-  if (error) return fail(res, error.message);
-  return ok(res, { message: 'Password reset email sent' });
+// POST /auth/forgot-password — placeholder
+router.post('/forgot-password', authLimiter, async (_req, res) => {
+  return ok(res, { message: 'If an account exists for that email, a reset link will be sent.' });
 });
 
 module.exports = router;
