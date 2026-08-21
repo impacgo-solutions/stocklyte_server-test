@@ -78,7 +78,10 @@ router.get('/stock-movement', async (req, res) => {
       const conditions = [];
       const params = [];
       if (from_date) { params.push(from_date); conditions.push(`created_at >= $${params.length}`); }
-      if (to_date) { params.push(to_date); conditions.push(`created_at <= $${params.length}`); }
+      // to_date is a bare YYYY-MM-DD from the client; casting it straight to timestamptz means
+      // midnight UTC, which excludes every transaction from that day itself. Use an exclusive
+      // upper bound on the *next* day instead so "today" is fully included.
+      if (to_date) { params.push(to_date); conditions.push(`created_at < $${params.length}::date + interval '1 day'`); }
       const where = conditions.length ? `where ${conditions.join(' and ')}` : '';
       const { rows: data } = await client.query(
         `select created_at, transaction_type, quantity from stock_transactions ${where} order by created_at`,
@@ -197,7 +200,8 @@ router.get('/export/csv', async (req, res) => {
       const conditions = [];
       const params = [];
       if (from_date) { params.push(from_date); conditions.push(`t.created_at >= $${params.length}`); }
-      if (to_date) { params.push(to_date); conditions.push(`t.created_at <= $${params.length}`); }
+      // Same exclusive-next-day fix as /stock-movement — see comment there.
+      if (to_date) { params.push(to_date); conditions.push(`t.created_at < $${params.length}::date + interval '1 day'`); }
       const where = conditions.length ? `where ${conditions.join(' and ')}` : '';
       const { rows: data } = await client.query(
         `select t.id, t.transaction_type, t.quantity, t.note, t.created_at,
