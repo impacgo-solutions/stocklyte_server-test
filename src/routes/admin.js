@@ -7,7 +7,7 @@ const { pool, withTenant, SCHEMA_NAME_RE } = require('../utils/db');
 const { generateUniqueSchemaName, createTenantSchema } = require('../utils/tenantProvisioning');
 const authenticate = require('../middleware/auth');
 const { requireRole } = require('../middleware/roleCheck');
-const { ok, fail } = require('../utils/response');
+const { ok, fail, stripSensitive, stripSensitiveList } = require('../utils/response');
 
 // Only the platform super_admin (created once via supabase/create_admin.js) can reach these routes.
 router.use(authenticate, requireRole('super_admin'));
@@ -104,7 +104,7 @@ router.get('/companies/:schemaName/admins', async (req, res) => {
     const { rows } = await client.query('select * from admin_users order by created_at');
     return rows;
   });
-  return ok(res, admins);
+  return ok(res, stripSensitiveList(admins));
 });
 
 // POST /admin/companies/:schemaName/admins — creates the Company Admin inside that
@@ -153,7 +153,7 @@ router.post('/companies/:schemaName/admins', createLimiter, async (req, res) => 
       [userId, schemaName, email.trim().toLowerCase()]
     );
 
-    return ok(res, adminProfile, 201);
+    return ok(res, stripSensitive(adminProfile), 201);
   } catch (err) {
     return fail(res, err.message);
   }

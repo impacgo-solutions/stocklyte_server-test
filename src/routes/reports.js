@@ -5,6 +5,8 @@ const { withTenant } = require('../utils/db');
 const authenticate = require('../middleware/auth');
 const checkSubscription = require('../middleware/checkSubscription');
 const { ok, fail } = require('../utils/response');
+const { buildTransactionFilters } = require('./transactions');
+const { scopeLocationId } = require('../utils/reportScope');
 
 router.use(authenticate, checkSubscription);
 
@@ -17,12 +19,18 @@ function toLocalDate(isoStr, tzOffsetMinutes) {
 }
 
 // GET /reports/summary
+// A manager/staff member gets the exact same shape, computed only from
+// their own assigned warehouse rather than the whole tenant.
 router.get('/summary', async (req, res) => {
   const now = new Date();
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
 
   try {
+    const scopeLoc = scopeLocationId(req);
     const summary = await withTenant(req.user.tenant_schema, async (client) => {
+      const txLocWhere = scopeLoc ? 'and (t.from_location_id = $2 or t.to_location_id = $2)' : '';
+      const txLocParams = scopeLoc ? [monthStart, scopeLoc] : [monthStart];
+
       const [
         { rows: totalProductsRows },
         { rows: stockRows },
@@ -31,10 +39,18 @@ router.get('/summary', async (req, res) => {
         { rows: recentTx },
         { rows: monthlyMovements },
       ] = await Promise.all([
-        client.query(`select count(*)::int as count from products where is_active = true`),
-        client.query(`select quantity from stock`),
-        client.query(`select s.quantity, p.low_stock_threshold from stock s join products p on p.id = s.product_id`),
-        client.query(`select count(*)::int as count from locations where is_active = true`),
+        scopeLoc
+          ? client.query(`select count(distinct p.id)::int as count from products p join stock s on s.product_id = p.id where p.is_active = true and s.location_id = $1`, [scopeLoc])
+          : client.query(`select count(*)::int as count from products where is_active = true`),
+        scopeLoc
+          ? client.query(`select quantity from stock where location_id = $1`, [scopeLoc])
+          : client.query(`select quantity from stock`),
+        scopeLoc
+          ? client.query(`select s.quantity, p.low_stock_threshold from stock s join products p on p.id = s.product_id where s.location_id = $1`, [scopeLoc])
+          : client.query(`select s.quantity, p.low_stock_threshold from stock s join products p on p.id = s.product_id`),
+        scopeLoc
+          ? client.query(`select count(*)::int as count from locations where is_active = true and id = $1`, [scopeLoc])
+          : client.query(`select count(*)::int as count from locations where is_active = true`),
         client.query(`
           select t.*,
             jsonb_build_object('name', p.name, 'sku', p.sku) as products,
@@ -44,9 +60,10 @@ router.get('/summary', async (req, res) => {
           join products p on p.id = t.product_id
           left join locations fl on fl.id = t.from_location_id
           left join locations tl on tl.id = t.to_location_id
+          ${scopeLoc ? 'where t.from_location_id = $1 or t.to_location_id = $1' : ''}
           order by t.created_at desc limit 10
-        `),
-        client.query(`select transaction_type, quantity from stock_transactions where created_at >= $1`, [monthStart]),
+        `, scopeLoc ? [scopeLoc] : []),
+        client.query(`select transaction_type, quantity from stock_transactions t where t.created_at >= $1 ${txLocWhere}`, txLocParams),
       ]);
 
       const totalStock = stockRows.reduce((s, r) => s + parseFloat(r.quantity || 0), 0);
@@ -66,7 +83,7 @@ router.get('/summary', async (req, res) => {
     });
     return ok(res, summary);
   } catch (err) {
-    return fail(res, err.message);
+    return fail(res, err.message, err.status || 400);
   }
 });
 
@@ -74,6 +91,7 @@ router.get('/summary', async (req, res) => {
 router.get('/stock-movement', async (req, res) => {
   const { from_date, to_date, tz } = req.query;
   try {
+    const scopeLoc = scopeLocationId(req);
     const grouped = await withTenant(req.user.tenant_schema, async (client) => {
       const conditions = [];
       const params = [];
@@ -82,6 +100,7 @@ router.get('/stock-movement', async (req, res) => {
       // midnight UTC, which excludes every transaction from that day itself. Use an exclusive
       // upper bound on the *next* day instead so "today" is fully included.
       if (to_date) { params.push(to_date); conditions.push(`created_at < $${params.length}::date + interval '1 day'`); }
+      if (scopeLoc) { params.push(scopeLoc); conditions.push(`(from_location_id = $${params.length} or to_location_id = $${params.length})`); }
       const where = conditions.length ? `where ${conditions.join(' and ')}` : '';
       const { rows: data } = await client.query(
         `select created_at, transaction_type, quantity from stock_transactions ${where} order by created_at`,
@@ -98,18 +117,20 @@ router.get('/stock-movement', async (req, res) => {
     });
     return ok(res, grouped);
   } catch (err) {
-    return fail(res, err.message);
+    return fail(res, err.message, err.status || 400);
   }
 });
 
 // GET /reports/by-location
 router.get('/by-location', async (req, res) => {
   try {
+    const scopeLoc = scopeLocationId(req);
     const result = await withTenant(req.user.tenant_schema, async (client) => {
       const { rows: data } = await client.query(`
         select s.quantity, l.id as location_id, l.name as location_name
         from stock s join locations l on l.id = s.location_id
-      `);
+        ${scopeLoc ? 'where s.location_id = $1' : ''}
+      `, scopeLoc ? [scopeLoc] : []);
       const grouped = {};
       data.forEach((s) => {
         const loc = s.location_name || 'Unknown';
@@ -119,21 +140,25 @@ router.get('/by-location', async (req, res) => {
     });
     return ok(res, result);
   } catch (err) {
-    return fail(res, err.message);
+    return fail(res, err.message, err.status || 400);
   }
 });
 
 // GET /reports/by-category
+// For a manager/staff member, both the stock sum and the product_count are
+// scoped to products actually stocked at their own warehouse.
 router.get('/by-category', async (req, res) => {
   try {
+    const scopeLoc = scopeLocationId(req);
     const result = await withTenant(req.user.tenant_schema, async (client) => {
       const { rows: data } = await client.query(`
         select p.id as product_id, c.name as category_name, c.color as category_color,
-               coalesce((select sum(s.quantity) from stock s where s.product_id = p.id), 0) as total_stock
+               coalesce((select sum(s.quantity) from stock s where s.product_id = p.id ${scopeLoc ? 'and s.location_id = $1' : ''}), 0) as total_stock
         from products p
         left join categories c on c.id = p.category_id
         where p.is_active = true
-      `);
+        ${scopeLoc ? 'and exists (select 1 from stock ws where ws.product_id = p.id and ws.location_id = $1)' : ''}
+      `, scopeLoc ? [scopeLoc] : []);
       const grouped = {};
       data.forEach((p) => {
         const cat = p.category_name || 'Uncategorized';
@@ -146,7 +171,7 @@ router.get('/by-category', async (req, res) => {
     });
     return ok(res, result);
   } catch (err) {
-    return fail(res, err.message);
+    return fail(res, err.message, err.status || 400);
   }
 });
 
@@ -159,8 +184,12 @@ router.get('/expiry-alerts', async (req, res) => {
   const targetStr = targetDate.toISOString().split('T')[0];
 
   try {
+    const scopeLoc = scopeLocationId(req);
     const result = await withTenant(req.user.tenant_schema, async (client) => {
       // expiry_date lives on stock_transactions (multi-lot fields), not stock
+      const params = [targetStr];
+      let locWhere = '';
+      if (scopeLoc) { params.push(scopeLoc); locWhere = `and t.to_location_id = $${params.length}`; }
       const { rows: data } = await client.query(
         `select t.*,
                 jsonb_build_object('id', p.id, 'name', p.name, 'sku', p.sku, 'image_url', p.image_url) as products,
@@ -168,8 +197,8 @@ router.get('/expiry-alerts', async (req, res) => {
          from stock_transactions t
          join products p on p.id = t.product_id
          left join locations l on l.id = t.to_location_id
-         where t.transaction_type = 'in' and t.expiry_date is not null and t.expiry_date <= $1 and t.quantity > 0`,
-        [targetStr]
+         where t.transaction_type = 'in' and t.expiry_date is not null and t.expiry_date <= $1 and t.quantity > 0 ${locWhere}`,
+        params
       );
 
       const mapped = data.map((s) => {
@@ -188,21 +217,18 @@ router.get('/expiry-alerts', async (req, res) => {
     });
     return ok(res, result);
   } catch (err) {
-    return fail(res, err.message);
+    return fail(res, err.message, err.status || 400);
   }
 });
 
-// GET /reports/export/csv
+// GET /reports/export/csv?from_date=&to_date=&type=&location_id=&product_id=&category_id=&performed_by=
+// Same filters as GET /transactions (and thus Stock Activity / Damaged
+// Products reports) — the export always matches whatever's filtered on screen.
 router.get('/export/csv', async (req, res) => {
-  const { from_date, to_date } = req.query;
   try {
+    const scopeLoc = scopeLocationId(req);
     const rows = await withTenant(req.user.tenant_schema, async (client) => {
-      const conditions = [];
-      const params = [];
-      if (from_date) { params.push(from_date); conditions.push(`t.created_at >= $${params.length}`); }
-      // Same exclusive-next-day fix as /stock-movement — see comment there.
-      if (to_date) { params.push(to_date); conditions.push(`t.created_at < $${params.length}::date + interval '1 day'`); }
-      const where = conditions.length ? `where ${conditions.join(' and ')}` : '';
+      const { where, params } = buildTransactionFilters(req.query, 't', scopeLoc);
       const { rows: data } = await client.query(
         `select t.id, t.transaction_type, t.quantity, t.note, t.created_at,
                 p.name as product_name, p.sku as product_sku,
@@ -238,15 +264,123 @@ router.get('/export/csv', async (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename="vaultiq-report-${Date.now()}.csv"`);
     res.send(csv);
   } catch (err) {
-    return fail(res, err.message);
+    return fail(res, err.message, err.status || 400);
+  }
+});
+
+// Shared by /current-stock and its CSV export. `status` computes the same
+// classification the Product model's isLowStock/isOutOfStock already use,
+// just evaluated per-warehouse (a product's threshold check against ITS
+// quantity at that one location) rather than summed tenant-wide.
+//
+// A manager/staff member's own warehouse always overrides whatever
+// location_id/cluster_id they passed (or didn't) — they can only ever see
+// their assigned warehouse's current stock, never another one's.
+function buildCurrentStockFilters(query, scopeLoc = null) {
+  const { location_id, cluster_id, category_id, product_id, status } = query;
+  const conditions = [];
+  const params = [];
+  if (scopeLoc) {
+    params.push(scopeLoc);
+    conditions.push(`s.location_id = $${params.length}`);
+  } else {
+    if (location_id) { params.push(location_id); conditions.push(`s.location_id = $${params.length}`); }
+    if (cluster_id) { params.push(cluster_id); conditions.push(`l.cluster_id = $${params.length}`); }
+  }
+  if (category_id) { params.push(category_id); conditions.push(`p.category_id = $${params.length}`); }
+  if (product_id) { params.push(product_id); conditions.push(`s.product_id = $${params.length}`); }
+  if (status === 'out_of_stock') conditions.push(`s.quantity <= 0`);
+  else if (status === 'low_stock') conditions.push(`s.quantity > 0 and s.quantity <= p.low_stock_threshold`);
+  else if (status === 'in_stock') conditions.push(`s.quantity > p.low_stock_threshold`);
+  return { where: conditions.length ? `where ${conditions.join(' and ')}` : '', params };
+}
+
+// GET /reports/current-stock?location_id=&cluster_id=&category_id=&product_id=&status=
+router.get('/current-stock', async (req, res) => {
+  try {
+    const scopeLoc = scopeLocationId(req);
+    const rows = await withTenant(req.user.tenant_schema, async (client) => {
+      const { where, params } = buildCurrentStockFilters(req.query, scopeLoc);
+      const { rows } = await client.query(
+        `select s.*,
+                jsonb_build_object('id', p.id, 'name', p.name, 'sku', p.sku, 'unit', p.unit, 'low_stock_threshold', p.low_stock_threshold, 'image_url', p.image_url, 'category_id', p.category_id) as products,
+                c.name as category_name, c.color as category_color,
+                jsonb_build_object('id', l.id, 'name', l.name, 'cluster_id', l.cluster_id) as locations,
+                cl.name as cluster_name,
+                case when s.quantity <= 0 then 'out_of_stock'
+                     when s.quantity <= p.low_stock_threshold then 'low_stock'
+                     else 'in_stock' end as stock_status
+         from stock s
+         join products p on p.id = s.product_id
+         join locations l on l.id = s.location_id
+         left join categories c on c.id = p.category_id
+         left join clusters cl on cl.id = l.cluster_id
+         ${where}
+         order by p.name asc, l.name asc`,
+        params
+      );
+      return rows;
+    });
+    return ok(res, rows);
+  } catch (err) {
+    return fail(res, err.message, err.status || 400);
+  }
+});
+
+// GET /reports/current-stock/export/csv — same filters as /current-stock
+router.get('/current-stock/export/csv', async (req, res) => {
+  try {
+    const scopeLoc = scopeLocationId(req);
+    const rows = await withTenant(req.user.tenant_schema, async (client) => {
+      const { where, params } = buildCurrentStockFilters(req.query, scopeLoc);
+      const { rows } = await client.query(
+        `select p.name as product_name, p.sku as product_sku, c.name as category_name,
+                l.name as location_name, s.quantity, s.reserved_quantity, s.in_transit_quantity, s.damaged_quantity,
+                p.low_stock_threshold,
+                case when s.quantity <= 0 then 'Out of Stock'
+                     when s.quantity <= p.low_stock_threshold then 'Low Stock'
+                     else 'In Stock' end as stock_status
+         from stock s
+         join products p on p.id = s.product_id
+         join locations l on l.id = s.location_id
+         left join categories c on c.id = p.category_id
+         ${where}
+         order by p.name asc, l.name asc`,
+        params
+      );
+      return rows;
+    });
+
+    const csvRows = rows.map((r) => ({
+      Product: r.product_name,
+      SKU: r.product_sku,
+      Category: r.category_name || '',
+      Warehouse: r.location_name,
+      Quantity: r.quantity,
+      Reserved: r.reserved_quantity,
+      InTransit: r.in_transit_quantity,
+      Damaged: r.damaged_quantity,
+      Threshold: r.low_stock_threshold,
+      Status: r.stock_status,
+    }));
+
+    const csv = stringify(csvRows, { header: true });
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="current-stock-report-${Date.now()}.csv"`);
+    res.send(csv);
+  } catch (err) {
+    return fail(res, err.message, err.status || 400);
   }
 });
 
 // GET /reports/product/:id?period=7d|30d|90d|all
+// A manager/staff member gets this same per-product report scoped to just
+// their own warehouse's stock and transaction history.
 router.get('/product/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const { period = '30d', tz } = req.query;
+    const scopeLoc = scopeLocationId(req);
 
     let fromDate = null;
     if (period !== 'all') {
@@ -267,16 +401,20 @@ router.get('/product/:id', async (req, res) => {
       if (!productRows[0]) return null;
       const product = productRows[0];
 
+      const stockParams = [id];
+      let stockWhere = 'where s.product_id = $1';
+      if (scopeLoc) { stockParams.push(scopeLoc); stockWhere += ` and s.location_id = $${stockParams.length}`; }
       const { rows: stockData } = await client.query(
         `select s.quantity, s.location_id, l.id as loc_id, l.name as loc_name
          from stock s join locations l on l.id = s.location_id
-         where s.product_id = $1`,
-        [id]
+         ${stockWhere}`,
+        stockParams
       );
 
       const txParams = [id];
       let txWhere = 'where t.product_id = $1';
       if (fromDate) { txParams.push(fromDate); txWhere += ` and t.created_at >= $${txParams.length}`; }
+      if (scopeLoc) { txParams.push(scopeLoc); txWhere += ` and (t.from_location_id = $${txParams.length} or t.to_location_id = $${txParams.length})`; }
       const { rows: transactions } = await client.query(
         `select t.id, t.transaction_type, t.quantity, t.note, t.created_at,
                 case when fl.id is null then null else jsonb_build_object('id', fl.id, 'name', fl.name) end as from_location,
@@ -364,7 +502,7 @@ router.get('/product/:id', async (req, res) => {
     if (!result) return fail(res, 'Product not found', 404);
     return ok(res, result);
   } catch (err) {
-    return fail(res, err.message);
+    return fail(res, err.message, err.status || 400);
   }
 });
 
@@ -390,6 +528,8 @@ router.get('/inventory-movement', async (req, res) => {
     const toTime = new Date(`${to_date}T23:59:59.999Z`).getTime();
     if (Number.isNaN(fromTime) || Number.isNaN(toTime)) return fail(res, 'Invalid from_date/to_date', 400);
 
+    const scopeLoc = scopeLocationId(req);
+
     const result = await withTenant(req.user.tenant_schema, async (client) => {
       const params = [];
       let where = 'where is_active = true';
@@ -399,15 +539,23 @@ router.get('/inventory-movement', async (req, res) => {
 
       const productIds = products.map((p) => p.id);
 
+      const txParams = [productIds, new Date(toTime).toISOString()];
+      let txWhere = 'where product_id = any($1) and created_at <= $2';
+      if (scopeLoc) { txParams.push(scopeLoc); txWhere += ` and (from_location_id = $${txParams.length} or to_location_id = $${txParams.length})`; }
+
+      const stockParams = [productIds];
+      let stockWhere = 'where product_id = any($1)';
+      if (scopeLoc) { stockParams.push(scopeLoc); stockWhere += ` and location_id = $${stockParams.length}`; }
+
       const [{ rows: transactions }, { rows: stockRows }] = await Promise.all([
         client.query(
           `select product_id, from_location_id, to_location_id, transaction_type, quantity, created_at
            from stock_transactions
-           where product_id = any($1) and created_at <= $2
+           ${txWhere}
            order by created_at asc`,
-          [productIds, new Date(toTime).toISOString()]
+          txParams
         ),
-        client.query(`select product_id, quantity from stock where product_id = any($1)`, [productIds]),
+        client.query(`select product_id, quantity from stock ${stockWhere}`, stockParams),
       ]);
 
       const txByProduct = new Map();
@@ -498,7 +646,7 @@ router.get('/inventory-movement', async (req, res) => {
 
     return ok(res, result);
   } catch (err) {
-    return fail(res, err.message);
+    return fail(res, err.message, err.status || 400);
   }
 });
 

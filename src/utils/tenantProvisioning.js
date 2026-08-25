@@ -11,6 +11,19 @@ const TABLES = [
   'stock_transactions',
   'audit_log',
   'notifications',
+  'clusters',
+  'racks',
+  'rack_stock',
+  'bins',
+  'bin_stock',
+  'location_routing_rules',
+  'product_requests',
+  'product_request_routes',
+  'product_request_status_history',
+  'transfers',
+  'transfer_items',
+  'transfer_status_history',
+  'cluster_relationships',
 ];
 
 // Foreign keys are never copied by `LIKE ... INCLUDING ALL` — Postgres only carries over
@@ -30,6 +43,50 @@ function foreignKeyStatements(schemaName) {
     `alter table ${q('audit_log')} add constraint audit_log_performed_by_fkey foreign key (performed_by) references ${q('admin_users')}(id) on delete set null`,
     `alter table ${q('notifications')} add constraint notifications_user_id_fkey foreign key (user_id) references ${q('admin_users')}(id) on delete cascade`,
     `alter table ${q('notifications')} add constraint notifications_related_product_id_fkey foreign key (related_product_id) references ${q('products')}(id) on delete set null`,
+    // Cluster-based product request & rejection workflow
+    `alter table ${q('locations')} add constraint locations_cluster_id_fkey foreign key (cluster_id) references ${q('clusters')}(id) on delete set null`,
+    `alter table ${q('racks')} add constraint racks_location_id_fkey foreign key (location_id) references ${q('locations')}(id) on delete cascade`,
+    `alter table ${q('rack_stock')} add constraint rack_stock_product_id_fkey foreign key (product_id) references ${q('products')}(id) on delete cascade`,
+    `alter table ${q('rack_stock')} add constraint rack_stock_rack_id_fkey foreign key (rack_id) references ${q('racks')}(id) on delete cascade`,
+    `alter table ${q('bins')} add constraint bins_rack_id_fkey foreign key (rack_id) references ${q('racks')}(id) on delete cascade`,
+    `alter table ${q('bin_stock')} add constraint bin_stock_product_id_fkey foreign key (product_id) references ${q('products')}(id) on delete cascade`,
+    `alter table ${q('bin_stock')} add constraint bin_stock_bin_id_fkey foreign key (bin_id) references ${q('bins')}(id) on delete cascade`,
+    `alter table ${q('location_routing_rules')} add constraint location_routing_rules_source_location_id_fkey foreign key (source_location_id) references ${q('locations')}(id) on delete cascade`,
+    `alter table ${q('location_routing_rules')} add constraint location_routing_rules_target_location_id_fkey foreign key (target_location_id) references ${q('locations')}(id) on delete cascade`,
+    `alter table ${q('product_requests')} add constraint product_requests_product_id_fkey foreign key (product_id) references ${q('products')}(id) on delete cascade`,
+    `alter table ${q('product_requests')} add constraint product_requests_requested_by_fkey foreign key (requested_by) references ${q('admin_users')}(id) on delete set null`,
+    `alter table ${q('product_requests')} add constraint product_requests_source_location_id_fkey foreign key (source_location_id) references ${q('locations')}(id) on delete restrict`,
+    `alter table ${q('product_requests')} add constraint product_requests_current_target_location_id_fkey foreign key (current_target_location_id) references ${q('locations')}(id) on delete set null`,
+    `alter table ${q('product_requests')} add constraint product_requests_cancelled_by_fkey foreign key (cancelled_by) references ${q('admin_users')}(id) on delete set null`,
+    `alter table ${q('product_request_routes')} add constraint product_request_routes_request_id_fkey foreign key (request_id) references ${q('product_requests')}(id) on delete cascade`,
+    `alter table ${q('product_request_routes')} add constraint product_request_routes_target_location_id_fkey foreign key (target_location_id) references ${q('locations')}(id) on delete restrict`,
+    `alter table ${q('product_request_routes')} add constraint product_request_routes_decided_by_fkey foreign key (decided_by) references ${q('admin_users')}(id) on delete set null`,
+    `alter table ${q('product_request_status_history')} add constraint product_request_status_history_request_id_fkey foreign key (request_id) references ${q('product_requests')}(id) on delete cascade`,
+    `alter table ${q('product_request_status_history')} add constraint product_request_status_history_location_id_fkey foreign key (location_id) references ${q('locations')}(id) on delete set null`,
+    `alter table ${q('product_request_status_history')} add constraint product_request_status_history_performed_by_fkey foreign key (performed_by) references ${q('admin_users')}(id) on delete set null`,
+    `alter table ${q('stock_transactions')} add constraint stock_transactions_related_request_id_fkey foreign key (related_request_id) references ${q('product_requests')}(id) on delete set null`,
+    `alter table ${q('notifications')} add constraint notifications_related_request_id_fkey foreign key (related_request_id) references ${q('product_requests')}(id) on delete set null`,
+    // Transfer Management & Transfer Reports workflow
+    `alter table ${q('transfers')} add constraint transfers_source_location_id_fkey foreign key (source_location_id) references ${q('locations')}(id) on delete restrict`,
+    `alter table ${q('transfers')} add constraint transfers_destination_location_id_fkey foreign key (destination_location_id) references ${q('locations')}(id) on delete restrict`,
+    `alter table ${q('transfers')} add constraint transfers_requested_by_fkey foreign key (requested_by) references ${q('admin_users')}(id) on delete set null`,
+    `alter table ${q('transfers')} add constraint transfers_approved_by_fkey foreign key (approved_by) references ${q('admin_users')}(id) on delete set null`,
+    `alter table ${q('transfers')} add constraint transfers_shipped_by_fkey foreign key (shipped_by) references ${q('admin_users')}(id) on delete set null`,
+    `alter table ${q('transfers')} add constraint transfers_received_by_fkey foreign key (received_by) references ${q('admin_users')}(id) on delete set null`,
+    `alter table ${q('transfers')} add constraint transfers_rejected_by_fkey foreign key (rejected_by) references ${q('admin_users')}(id) on delete set null`,
+    `alter table ${q('transfers')} add constraint transfers_cancelled_by_fkey foreign key (cancelled_by) references ${q('admin_users')}(id) on delete set null`,
+    `alter table ${q('transfer_items')} add constraint transfer_items_transfer_id_fkey foreign key (transfer_id) references ${q('transfers')}(id) on delete cascade`,
+    `alter table ${q('transfer_items')} add constraint transfer_items_product_id_fkey foreign key (product_id) references ${q('products')}(id) on delete cascade`,
+    `alter table ${q('transfer_status_history')} add constraint transfer_status_history_transfer_id_fkey foreign key (transfer_id) references ${q('transfers')}(id) on delete cascade`,
+    `alter table ${q('transfer_status_history')} add constraint transfer_status_history_performed_by_fkey foreign key (performed_by) references ${q('admin_users')}(id) on delete set null`,
+    `alter table ${q('stock_transactions')} add constraint stock_transactions_related_transfer_id_fkey foreign key (related_transfer_id) references ${q('transfers')}(id) on delete set null`,
+    // Hierarchy-based approval routing — inert until 008_transfer_approval_hierarchy_template.sql
+    // has actually been applied to `template` (these columns don't exist until then).
+    `alter table ${q('admin_users')} add constraint admin_users_reports_to_fkey foreign key (reports_to) references ${q('admin_users')}(id) on delete set null`,
+    `alter table ${q('transfers')} add constraint transfers_pending_approver_id_fkey foreign key (pending_approver_id) references ${q('admin_users')}(id) on delete set null`,
+    // Cluster Relationship Management
+    `alter table ${q('cluster_relationships')} add constraint cluster_relationships_source_cluster_id_fkey foreign key (source_cluster_id) references ${q('clusters')}(id) on delete cascade`,
+    `alter table ${q('cluster_relationships')} add constraint cluster_relationships_target_cluster_id_fkey foreign key (target_cluster_id) references ${q('clusters')}(id) on delete cascade`,
   ];
 }
 
@@ -40,6 +97,22 @@ const FUNCTION_NAMES = [
   'stock_in_lot',
   'stock_out',
   'transfer_stock',
+  'generate_routing_sequence',
+  'next_eligible_location',
+  'create_product_request',
+  'reject_product_request',
+  'accept_product_request',
+  'receive_product_request',
+  'cancel_product_request',
+  'report_damaged_stock',
+  'restore_damaged_stock',
+  'writeoff_damaged_stock',
+  'submit_transfer',
+  'approve_transfer',
+  'reject_transfer',
+  'ship_transfer',
+  'receive_transfer',
+  'cancel_transfer',
 ];
 
 // Trigger structure is stable and small enough to hand-maintain here rather than
@@ -53,6 +126,13 @@ function triggerStatements(schemaName) {
     `create trigger audit_stock after insert or update or delete on ${q('stock')} for each row execute function ${q('audit_trigger_func')}()`,
     `create trigger audit_locations after insert or update or delete on ${q('locations')} for each row execute function ${q('audit_trigger_func')}()`,
     `create trigger stock_low_stock_check after insert or update of quantity on ${q('stock')} for each row execute function ${q('notify_low_stock')}()`,
+    `create trigger product_requests_updated_at before update on ${q('product_requests')} for each row execute function ${q('update_updated_at')}()`,
+    `create trigger audit_product_requests after insert or update or delete on ${q('product_requests')} for each row execute function ${q('audit_trigger_func')}()`,
+    `create trigger location_routing_rules_updated_at before update on ${q('location_routing_rules')} for each row execute function ${q('update_updated_at')}()`,
+    `create trigger rack_stock_updated_at before update on ${q('rack_stock')} for each row execute function ${q('update_updated_at')}()`,
+    `create trigger bin_stock_updated_at before update on ${q('bin_stock')} for each row execute function ${q('update_updated_at')}()`,
+    `create trigger transfers_updated_at before update on ${q('transfers')} for each row execute function ${q('update_updated_at')}()`,
+    `create trigger audit_transfers after insert or update or delete on ${q('transfers')} for each row execute function ${q('audit_trigger_func')}()`,
   ];
 }
 

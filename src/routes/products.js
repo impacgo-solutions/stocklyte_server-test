@@ -7,6 +7,7 @@ const authenticate = require('../middleware/auth');
 const checkSubscription = require('../middleware/checkSubscription');
 const { requireRole, requireMinRole } = require('../middleware/roleCheck');
 const { ok, fail, paginate } = require('../utils/response');
+const { scopeLocationId } = require('../utils/reportScope');
 
 const ALLOWED_MIME = new Set(['image/jpeg', 'image/jpg', 'image/png', 'image/webp']);
 const upload = multer({
@@ -48,6 +49,9 @@ async function attachRelations(client, products) {
         product_id: s.product_id,
         location_id: s.location_id,
         quantity: s.quantity,
+        reserved_quantity: s.reserved_quantity,
+        in_transit_quantity: s.in_transit_quantity,
+        damaged_quantity: s.damaged_quantity,
         updated_at: s.updated_at,
         locations: { name: s.location_name },
       });
@@ -59,6 +63,20 @@ async function attachRelations(client, products) {
     categories: p.category_id ? categoryById[p.category_id] || null : null,
     stock: stockByProduct[p.id] || [],
   }));
+}
+
+// A product can only be assigned to a category that exists and is active —
+// prevents a retired/deleted category id sticking around on new or edited
+// products.
+async function assertActiveCategory(client, categoryId) {
+  if (!categoryId) return;
+  const { rows } = await client.query('select is_active from categories where id = $1', [categoryId]);
+  if (!rows[0]) {
+    throw Object.assign(new Error('Category not found'), { status: 400 });
+  }
+  if (rows[0].is_active === false) {
+    throw Object.assign(new Error('Cannot assign a product to an inactive category'), { status: 400 });
+  }
 }
 
 // GET /products — search, filter, paginate
@@ -161,6 +179,68 @@ router.get('/:id', async (req, res) => {
   }
 });
 
+// GET /products/:id/racks — product → warehouse → location → rack → bin
+// hierarchy: every rack (any warehouse this caller can see) currently
+// holding this product, with the location's own available/reserved/damaged
+// quantities for context, plus this product's bin-level breakdown (if any)
+// nested under each rack. A manager/staff member only sees their own
+// warehouse's racks.
+router.get('/:id/racks', async (req, res) => {
+  try {
+    const scopeLoc = scopeLocationId(req);
+    const result = await withTenant(req.user.tenant_schema, async (client) => {
+      const { rows: productRows } = await client.query('select id, name, sku from products where id = $1', [req.params.id]);
+      if (!productRows[0]) return null;
+
+      const params = [req.params.id];
+      let where = 'where rs.product_id = $1';
+      if (scopeLoc) { params.push(scopeLoc); where += ` and l.id = $${params.length}`; }
+
+      const { rows } = await client.query(
+        `select rs.rack_id, rs.quantity as rack_quantity, rs.updated_at,
+                r.code as rack_code, r.name as rack_name, r.capacity as rack_capacity, r.is_active as rack_is_active,
+                l.id as location_id, l.name as location_name, l.cluster_id,
+                cl.name as cluster_name,
+                s.quantity as location_quantity, s.reserved_quantity, s.damaged_quantity, s.in_transit_quantity
+         from rack_stock rs
+         join racks r on r.id = rs.rack_id
+         join locations l on l.id = r.location_id
+         left join clusters cl on cl.id = l.cluster_id
+         left join stock s on s.product_id = rs.product_id and s.location_id = l.id
+         ${where}
+         order by l.name asc, r.code asc`,
+        params
+      );
+
+      const rackIds = rows.map((r) => r.rack_id);
+      let binsByRack = {};
+      if (rackIds.length > 0) {
+        const { rows: binRows } = await client.query(
+          `select b.rack_id, b.id as bin_id, b.code as bin_code, b.name as bin_name,
+                  b.capacity as bin_capacity, b.is_active as bin_is_active,
+                  bs.quantity as bin_quantity, bs.updated_at
+           from bin_stock bs
+           join bins b on b.id = bs.bin_id
+           where bs.product_id = $1 and b.rack_id = any($2)
+           order by b.code asc`,
+          [req.params.id, rackIds]
+        );
+        for (const b of binRows) {
+          (binsByRack[b.rack_id] ||= []).push(b);
+        }
+      }
+
+      const racks = rows.map((r) => ({ ...r, bins: binsByRack[r.rack_id] || [] }));
+
+      return { product: productRows[0], racks };
+    });
+    if (!result) return fail(res, 'Product not found', 404);
+    return ok(res, result);
+  } catch (err) {
+    return fail(res, err.message, err.status || 400);
+  }
+});
+
 // POST /products — with optional image upload
 router.post('/', requireMinRole('staff'), upload.single('image'), async (req, res) => {
   const { name, sku, barcode, category_id, description, unit, low_stock_threshold } = req.body;
@@ -180,6 +260,7 @@ router.post('/', requireMinRole('staff'), upload.single('image'), async (req, re
 
   try {
     const product = await withTenant(req.user.tenant_schema, req.user.id, async (client) => {
+      await assertActiveCategory(client, category_id || null);
       const { rows } = await client.query(
         `insert into products (name, sku, barcode, category_id, description, unit, low_stock_threshold, image_url)
          values ($1,$2,$3,$4,$5,$6,$7,$8) returning *`,
@@ -216,6 +297,7 @@ router.put('/:id', requireMinRole('staff'), upload.single('image'), async (req, 
 
   try {
     const product = await withTenant(req.user.tenant_schema, req.user.id, async (client) => {
+      if (category_id) await assertActiveCategory(client, category_id);
       const { rows } = await client.query(
         `update products set
            name = coalesce($2, name),
