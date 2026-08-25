@@ -8,11 +8,16 @@ const { ok, fail } = require('../utils/response');
 
 router.use(authenticate, checkSubscription);
 
+const LOCATION_SELECT = `
+  select l.*, case when c.id is null then null else jsonb_build_object('id', c.id, 'name', c.name) end as clusters
+  from locations l left join clusters c on c.id = l.cluster_id
+`;
+
 // GET /locations
 router.get('/', async (req, res) => {
   try {
     const locations = await withTenant(req.user.tenant_schema, async (client) => {
-      const { rows } = await client.query('select * from locations order by name');
+      const { rows } = await client.query(`${LOCATION_SELECT} order by l.name`);
       return rows;
     });
     return ok(res, locations);
@@ -25,7 +30,7 @@ router.get('/', async (req, res) => {
 router.get('/:id', async (req, res) => {
   try {
     const location = await withTenant(req.user.tenant_schema, async (client) => {
-      const { rows } = await client.query('select * from locations where id = $1', [req.params.id]);
+      const { rows } = await client.query(`${LOCATION_SELECT} where l.id = $1`, [req.params.id]);
       return rows[0] || null;
     });
     if (!location) return fail(res, 'Location not found', 404);
@@ -37,13 +42,13 @@ router.get('/:id', async (req, res) => {
 
 // POST /locations — admin only
 router.post('/', requireRole('admin'), async (req, res) => {
-  const { name, address } = req.body;
+  const { name, address, cluster_id, latitude, longitude } = req.body;
   if (!name) return fail(res, 'name is required');
   try {
     const location = await withTenant(req.user.tenant_schema, req.user.id, async (client) => {
       const { rows } = await client.query(
-        'insert into locations (name, address) values ($1, $2) returning *',
-        [name, address || null]
+        'insert into locations (name, address, cluster_id, latitude, longitude) values ($1, $2, $3, $4, $5) returning *',
+        [name, address || null, cluster_id || null, latitude ?? null, longitude ?? null]
       );
       return rows[0];
     });
@@ -55,16 +60,28 @@ router.post('/', requireRole('admin'), async (req, res) => {
 
 // PUT /locations/:id — admin only
 router.put('/:id', requireRole('admin'), async (req, res) => {
-  const { name, address, is_active } = req.body;
+  const { name, address, is_active, cluster_id, latitude, longitude } = req.body;
   try {
     const location = await withTenant(req.user.tenant_schema, req.user.id, async (client) => {
       const { rows } = await client.query(
         `update locations set
            name = coalesce($2, name),
            address = coalesce($3, address),
-           is_active = coalesce($4, is_active)
+           is_active = coalesce($4, is_active),
+           cluster_id = case when $5 then null else coalesce($6, cluster_id) end,
+           latitude = coalesce($7, latitude),
+           longitude = coalesce($8, longitude)
          where id = $1 returning *`,
-        [req.params.id, name ?? null, address ?? null, is_active === undefined ? null : (is_active === true || is_active === 'true')]
+        [
+          req.params.id,
+          name ?? null,
+          address ?? null,
+          is_active === undefined ? null : (is_active === true || is_active === 'true'),
+          cluster_id === null,
+          cluster_id ?? null,
+          latitude ?? null,
+          longitude ?? null,
+        ]
       );
       return rows[0] || null;
     });

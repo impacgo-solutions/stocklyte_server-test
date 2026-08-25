@@ -9,7 +9,7 @@ const { getCompanySubscription } = require('../utils/subscription');
 const { signAccessToken, signRefreshToken, verifyRefreshToken } = require('../utils/jwt');
 const { generateUniqueSchemaName, createTenantSchema } = require('../utils/tenantProvisioning');
 const authenticate = require('../middleware/auth');
-const { ok, fail } = require('../utils/response');
+const { ok, fail, stripSensitive } = require('../utils/response');
 const { sendSignupNotification } = require('../utils/notifyEmail');
 
 const authLimiter = rateLimit({
@@ -50,7 +50,7 @@ router.post('/login', authLimiter, async (req, res) => {
     return ok(res, {
       access_token: signAccessToken({ ...tokenPayload, email: sa.email }),
       refresh_token: signRefreshToken(tokenPayload),
-      user: { id: sa.id, email: sa.email, profile: { ...sa, role: 'super_admin' } },
+      user: { id: sa.id, email: sa.email, profile: stripSensitive({ ...sa, role: 'super_admin' }) },
     });
   }
 
@@ -89,11 +89,11 @@ router.post('/login', authLimiter, async (req, res) => {
     user: {
       id: user_id,
       email: profile.email,
-      profile: {
+      profile: stripSensitive({
         ...profile,
         subscription_status: subscription?.subscription_status || null,
         trial_ends_at: subscription?.trial_ends_at || null,
-      },
+      }),
     },
   });
 });
@@ -108,7 +108,7 @@ router.get('/me', authenticate, async (req, res) => {
   if (req.user.role === 'super_admin') {
     const { rows } = await pool.query('select * from public.super_admins where id = $1', [req.user.id]);
     if (rows.length === 0) return fail(res, 'Account not found', 404);
-    return ok(res, { ...rows[0], role: 'super_admin' });
+    return ok(res, stripSensitive({ ...rows[0], role: 'super_admin' }));
   }
 
   const profile = await withTenant(req.user.tenant_schema, async (client) => {
@@ -118,12 +118,12 @@ router.get('/me', authenticate, async (req, res) => {
   if (!profile) return fail(res, 'Account not found', 404);
 
   const subscription = await getCompanySubscription(req.user.tenant_schema);
-  return ok(res, {
+  return ok(res, stripSensitive({
     ...profile,
     email: req.user.email,
     subscription_status: subscription?.subscription_status || null,
     trial_ends_at: subscription?.trial_ends_at || null,
-  });
+  }));
 });
 
 // POST /auth/refresh
@@ -203,7 +203,7 @@ router.post('/signup', signupLimiter, async (req, res) => {
 
     sendSignupNotification({ first_name, last_name, email: normalizedEmail, phone, organization_name, req });
 
-    return ok(res, { ...adminProfile, company: { name: organization_name.trim(), schema_name: schemaName } }, 201);
+    return ok(res, stripSensitive({ ...adminProfile, company: { name: organization_name.trim(), schema_name: schemaName } }), 201);
   } catch (err) {
     if (companyCreated) {
       await pool.query('delete from public.companies where schema_name = $1', [schemaName]).catch(() => {});

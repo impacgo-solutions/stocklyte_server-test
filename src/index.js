@@ -14,6 +14,7 @@ for (const key of REQUIRED_ENV) {
 }
 const express = require('express');
 const helmet = require('helmet');
+const cors = require('cors');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const pino = require('pino');
@@ -30,6 +31,17 @@ const logger = pino({ level: process.env.NODE_ENV === 'production' ? 'info' : 'd
 app.set('trust proxy', Number(process.env.TRUST_PROXY) || 1);
 
 // ── Security & Middleware ──────────────────────────────────
+// Both Flutter web apps (Tenant, Super Admin) run on their own origin/port and call this
+// API cross-origin — the `cors` package was already a dependency but was never actually
+// wired up, so every browser-based request (including the login preflight) was silently
+// blocked by the browser itself. CORS_ORIGIN is a comma-separated allowlist so multiple
+// local dev ports / deployed frontend domains can be configured without a code change.
+const corsOrigins = (process.env.CORS_ORIGIN || '').split(',').map((o) => o.trim()).filter(Boolean);
+app.use(cors({
+  origin: corsOrigins.length > 0 ? corsOrigins : true,
+  credentials: true,
+  allowedHeaders: ['Authorization', 'Content-Type', 'X-Idempotency-Key'],
+}));
 app.use(helmet());
 app.use(compression());
 app.use(express.json({ limit: '10mb' }));
@@ -60,11 +72,19 @@ app.use(`${V1}/auth`, require('./routes/auth'));
 app.use(`${V1}/admin`, require('./routes/admin'));
 app.use(`${V1}/team`, require('./routes/team'));
 app.use(`${V1}/locations`, require('./routes/locations'));
+app.use(`${V1}/clusters`, require('./routes/clusters'));
+app.use(`${V1}/cluster-relationships`, require('./routes/clusterRelationships'));
+app.use(`${V1}/racks`, require('./routes/racks'));
+app.use(`${V1}/bins`, require('./routes/bins'));
+app.use(`${V1}/routing-rules`, require('./routes/routingRules'));
+app.use(`${V1}/product-requests`, require('./routes/productRequests'));
 app.use(`${V1}/categories`, require('./routes/categories'));
 app.use(`${V1}/products`, require('./routes/products'));
 app.use(`${V1}/stock`, require('./routes/stock'));
+app.use(`${V1}/transfers`, require('./routes/transfers'));
 app.use(`${V1}/transactions`, require('./routes/transactions'));
 app.use(`${V1}/reports`, require('./routes/reports'));
+app.use(`${V1}/predictions`, require('./routes/predictions'));
 app.use(`${V1}/audit`, require('./routes/audit'));
 app.use(`${V1}/notifications`, require('./routes/notifications'));
 

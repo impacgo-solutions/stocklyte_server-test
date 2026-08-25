@@ -15,9 +15,15 @@ router.get('/', async (req, res) => {
         `select n.*,
                 case when p.id is null then null
                   else jsonb_build_object('id', p.id, 'name', p.name, 'sku', p.sku, 'image_url', p.image_url)
-                end as products
+                end as products,
+                case when pr.id is null then null
+                  else jsonb_build_object('id', pr.id, 'status', pr.status, 'quantity', pr.quantity,
+                                           'current_target_location_id', pr.current_target_location_id,
+                                           'source_location_id', pr.source_location_id)
+                end as product_request
          from notifications n
          left join products p on p.id = n.related_product_id
+         left join product_requests pr on pr.id = n.related_request_id
          where n.user_id = $1
          order by n.created_at desc
          limit 50`,
