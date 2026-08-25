@@ -97,6 +97,7 @@ const FUNCTION_NAMES = [
   'stock_in_lot',
   'stock_out',
   'transfer_stock',
+  'generate_routing_sequence',
   'next_eligible_location',
   'create_product_request',
   'reject_product_request',

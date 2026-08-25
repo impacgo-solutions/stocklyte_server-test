@@ -20,8 +20,8 @@ router.get('/', async (req, res) => {
       if (source_location_id) { params.push(source_location_id); where = 'where rr.source_location_id = $1'; }
       const { rows } = await client.query(
         `select rr.*,
-                jsonb_build_object('id', sl.id, 'name', sl.name) as source_location,
-                jsonb_build_object('id', tl.id, 'name', tl.name) as target_location
+                jsonb_build_object('id', sl.id, 'name', sl.name, 'latitude', sl.latitude, 'longitude', sl.longitude) as source_location,
+                jsonb_build_object('id', tl.id, 'name', tl.name, 'latitude', tl.latitude, 'longitude', tl.longitude) as target_location
          from location_routing_rules rr
          join locations sl on sl.id = rr.source_location_id
          join locations tl on tl.id = rr.target_location_id
@@ -34,6 +34,56 @@ router.get('/', async (req, res) => {
     return ok(res, rules);
   } catch (err) {
     return fail(res, err.message);
+  }
+});
+
+// POST /routing-rules/generate { source_location_id }
+// Auto-computes and PERSISTS a nearest-to-farthest sequence for the given
+// source, replacing whatever rules it currently has, from that location's
+// own latitude/longitude against every other active, coordinate-having,
+// cluster-eligible location (same eligibility next_eligible_location's
+// fallback tier already uses) — the same generate_routing_sequence()
+// function next_eligible_location() calls automatically the first time a
+// source with no rules is ever routed. Exposed here so an admin can
+// explicitly refresh a source's sequence on demand (e.g. after adding a
+// new warehouse or updating coordinates) without waiting for that
+// first-use bootstrap.
+router.post('/generate', async (req, res) => {
+  const { source_location_id } = req.body;
+  if (!source_location_id) return fail(res, 'source_location_id is required');
+
+  try {
+    const result = await withTenant(req.user.tenant_schema, req.user.id, async (client) => {
+      const { rows: locRows } = await client.query(
+        'select latitude, longitude from locations where id = $1',
+        [source_location_id]
+      );
+      if (!locRows[0]) throw Object.assign(new Error('Location not found'), { status: 404 });
+      if (locRows[0].latitude == null || locRows[0].longitude == null) {
+        throw Object.assign(
+          new Error('This location has no latitude/longitude configured — add coordinates first'),
+          { status: 400 }
+        );
+      }
+
+      await client.query('select generate_routing_sequence($1)', [source_location_id]);
+
+      const { rows } = await client.query(
+        `select rr.*,
+                jsonb_build_object('id', sl.id, 'name', sl.name, 'latitude', sl.latitude, 'longitude', sl.longitude) as source_location,
+                jsonb_build_object('id', tl.id, 'name', tl.name, 'latitude', tl.latitude, 'longitude', tl.longitude) as target_location
+         from location_routing_rules rr
+         join locations sl on sl.id = rr.source_location_id
+         join locations tl on tl.id = rr.target_location_id
+         where rr.source_location_id = $1
+         order by rr.priority`,
+        [source_location_id]
+      );
+      return rows;
+    });
+    return ok(res, result, 201);
+  } catch (err) {
+    return fail(res, err.message, err.status || 400);
   }
 });
 

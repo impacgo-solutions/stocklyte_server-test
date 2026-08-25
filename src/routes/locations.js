@@ -8,6 +8,22 @@ const { ok, fail } = require('../utils/response');
 
 router.use(authenticate, checkSubscription);
 
+// Coordinates are optional (distance-based routing simply skips a location
+// with none), but if given at all they must be valid numbers within the
+// real-world lat/long range — a typo here would otherwise silently corrupt
+// next_eligible_location()'s haversine distance ordering.
+function validateCoordinates(latitude, longitude) {
+  if (latitude !== undefined && latitude !== null && latitude !== '') {
+    const lat = Number(latitude);
+    if (Number.isNaN(lat) || lat < -90 || lat > 90) return 'latitude must be a number between -90 and 90';
+  }
+  if (longitude !== undefined && longitude !== null && longitude !== '') {
+    const lng = Number(longitude);
+    if (Number.isNaN(lng) || lng < -180 || lng > 180) return 'longitude must be a number between -180 and 180';
+  }
+  return null;
+}
+
 const LOCATION_SELECT = `
   select l.*, case when c.id is null then null else jsonb_build_object('id', c.id, 'name', c.name) end as clusters
   from locations l left join clusters c on c.id = l.cluster_id
@@ -44,6 +60,8 @@ router.get('/:id', async (req, res) => {
 router.post('/', requireRole('admin'), async (req, res) => {
   const { name, address, cluster_id, latitude, longitude } = req.body;
   if (!name) return fail(res, 'name is required');
+  const coordError = validateCoordinates(latitude, longitude);
+  if (coordError) return fail(res, coordError);
   try {
     const location = await withTenant(req.user.tenant_schema, req.user.id, async (client) => {
       const { rows } = await client.query(
@@ -61,6 +79,8 @@ router.post('/', requireRole('admin'), async (req, res) => {
 // PUT /locations/:id — admin only
 router.put('/:id', requireRole('admin'), async (req, res) => {
   const { name, address, is_active, cluster_id, latitude, longitude } = req.body;
+  const coordError = validateCoordinates(latitude, longitude);
+  if (coordError) return fail(res, coordError);
   try {
     const location = await withTenant(req.user.tenant_schema, req.user.id, async (client) => {
       const { rows } = await client.query(
